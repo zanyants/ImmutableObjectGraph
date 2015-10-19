@@ -66,6 +66,7 @@
     <Compile Include="Adapters\IImmutableCollectionAdapter.cs" />
     <Compile Include="Adapters\ImmutableListRootAdapter.cs" />
     <Compile Include="ChangeKind.cs" />
+    <Compile Include="CodeGeneration\PropertyTypeAttribute.cs" />
     <Compile Include="Generators\CodeGenerationAttribute.cs" />
     <Compile Include="CollectionExtensions.cs" />
     <Compile Include="Adapters\ImmutableSetRootAdapter.cs" />

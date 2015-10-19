@@ -144,7 +144,7 @@
                 innerMembers.Add(CreateWithMethod());
             }
 
-            innerMembers.AddRange(this.GetFieldVariables().Select(fv => CreatePropertyForField(fv.Key, fv.Value)));
+            innerMembers.AddRange(this.GetFieldVariables().SelectMany(fv => CreatePropertiesForField(fv.Key, fv.Value)));
 
             this.MergeFeature(new BuilderGen(this));
             this.MergeFeature(new DeltaGen(this));
@@ -184,11 +184,16 @@
             return outerMembers;
         }
 
-        private static PropertyDeclarationSyntax CreatePropertyForField(FieldDeclarationSyntax field, VariableDeclaratorSyntax variable)
+        private IEnumerable<PropertyDeclarationSyntax> CreatePropertiesForField(FieldDeclarationSyntax field, VariableDeclaratorSyntax variable)
         {
             var xmldocComment = field.GetLeadingTrivia().FirstOrDefault(t => t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia));
 
-            var property = SyntaxFactory.PropertyDeclaration(field.Declaration.Type, variable.Identifier.ValueText.ToPascalCase())
+            var propertyTypeSymbol = GetPropertyType(this.semanticModel.GetDeclaredSymbol(variable) as IFieldSymbol);
+            var propertyTypeName = propertyTypeSymbol.ToMinimalDisplayString(this.semanticModel, field.SpanStart);
+            var propertyType = SyntaxFactory.ParseTypeName(propertyTypeName);
+
+            // Create the public property, which will have the same type as the field or the type as specified by a [PropertyType] attribute, if present.
+            var property = SyntaxFactory.PropertyDeclaration(propertyType, variable.Identifier.ValueText.ToPascalCase())
                 .WithModifiers(SyntaxFactory.TokenList(SyntaxFactory.Token(SyntaxKind.PublicKeyword)))
                 .WithAccessorList(
                     SyntaxFactory.AccessorList(SyntaxFactory.List(new AccessorDeclarationSyntax[] {
@@ -199,7 +204,26 @@
                                             SyntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, SyntaxFactory.ThisExpression(), SyntaxFactory.IdentifierName(variable.Identifier))
                                         ))) })))
                 .WithLeadingTrivia(xmldocComment); // TODO: modify the <summary> to translate "Some description" to "Gets some description."
-            return property;
+            yield return property;
+
+            // If the type is not sealed, create the protected property, which always has the same type as the field.            
+            property = SyntaxFactory.PropertyDeclaration(field.Declaration.Type, GetRawPropertyNameForField(variable.Identifier.ValueText))
+                .WithModifiers(SyntaxFactory.TokenList(SyntaxFactory.Token(SyntaxKind.ProtectedKeyword)))
+                .WithAccessorList(
+                    SyntaxFactory.AccessorList(SyntaxFactory.List(new AccessorDeclarationSyntax[] {
+                                SyntaxFactory.AccessorDeclaration(
+                                    SyntaxKind.GetAccessorDeclaration,
+                                    SyntaxFactory.Block(
+                                        SyntaxFactory.ReturnStatement(
+                                            SyntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, SyntaxFactory.ThisExpression(), SyntaxFactory.IdentifierName(variable.Identifier))
+                                        ))) })))
+                .WithLeadingTrivia(xmldocComment); // TODO: modify the <summary> to translate "Some description" to "Gets some description."
+            yield return property;
+        }
+
+        private static string GetRawPropertyNameForField(string fieldName)
+        {
+            return "__" + fieldName;
         }
 
         private void ValidateInput()
@@ -433,7 +457,7 @@
                             SyntaxFactory.ReturnStatement(
                                 SyntaxFactory.InvocationExpression(
                                     Syntax.ThisDot(WithFactoryMethodName),
-                                    this.CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrProperty, OptionalStyle.Always)
+                                    this.CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrRawProperty, OptionalStyle.Always)
                                     .AddArguments(SyntaxFactory.Argument(SyntaxFactory.NameColon(IdentityParameterName), NoneToken, Syntax.OptionalFor(Syntax.ThisDot(IdentityPropertyName))))))));
                 }
 
@@ -473,7 +497,7 @@
                             SyntaxKind.NotEqualsExpression,
                             Syntax.OptionalValue(fieldName),
                             Syntax.ThisDot(propertyName))));
-            Func<MetaField, ExpressionSyntax> isChanged = v => isChangedByNames(v.NameAsProperty, v.NameAsField);
+            Func<MetaField, ExpressionSyntax> isChanged = v => isChangedByNames(v.NameAsRawProperty, v.NameAsField);
             var anyChangesExpression =
                 new ExpressionSyntax[] { isChangedByNames(IdentityPropertyName, IdentityParameterName) }.Concat(
                     this.applyToMetaType.AllFields.Select(isChanged))
@@ -494,7 +518,7 @@
                             SyntaxFactory.ReturnStatement(
                                 SyntaxFactory.ObjectCreationExpression(
                                     SyntaxFactory.IdentifierName(applyTo.Identifier),
-                                    CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrProperty)
+                                    CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrRawProperty)
                                         .PrependArgument(SyntaxFactory.Argument(SyntaxFactory.NameColon(IdentityParameterName), NoneToken, Syntax.OptionalGetValueOrDefault(SyntaxFactory.IdentifierName(IdentityParameterName.Identifier), Syntax.ThisDot(IdentityPropertyName))))
                                         .AddArguments(DoNotSkipValidationArgument),
                                     null))),
@@ -520,7 +544,7 @@
                                 SyntaxKind.SimpleMemberAccessExpression,
                                 DefaultInstanceFieldName,
                                 WithFactoryMethodName),
-                            CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrTemplate, asOptional: OptionalStyle.Always)
+                            CreateArgumentList(this.applyToMetaType.AllFields, ArgSource.OptionalArgumentOrTemplateRawProperty, asOptional: OptionalStyle.Always)
                                 .AddArguments(SyntaxFactory.Argument(SyntaxFactory.NameColon(IdentityParameterName), NoneToken, IdentityParameterName)))));
             }
             else
@@ -659,22 +683,28 @@
 
         private ArgumentListSyntax CreateArgumentList(IEnumerable<MetaField> fields, ArgSource source = ArgSource.Property, OptionalStyle asOptional = OptionalStyle.None)
         {
-            Func<MetaField, ArgSource> fieldSource = f => (source == ArgSource.OptionalArgumentOrTemplate && f.IsRequired) ? ArgSource.Argument : source;
+            Func<MetaField, ArgSource> fieldSource = f => ((source == ArgSource.OptionalArgumentOrTemplate || source == ArgSource.OptionalArgumentOrTemplateRawProperty) && f.IsRequired) ? ArgSource.Argument : source;
             Func<MetaField, bool> optionalWrap = f => asOptional != OptionalStyle.None && (asOptional == OptionalStyle.Always || !f.IsRequired);
             Func<MetaField, ExpressionSyntax> dereference = f =>
             {
                 var name = SyntaxFactory.IdentifierName(f.Name);
-                var propertyName = SyntaxFactory.IdentifierName(f.Name.ToPascalCase());
+                var propertyName = f.NameAsProperty;
+                var rawPropertyName = f.NameAsRawProperty;
+
                 switch (fieldSource(f))
                 {
                     case ArgSource.Property:
                         return Syntax.ThisDot(propertyName);
                     case ArgSource.Argument:
                         return name;
+                    case ArgSource.OptionalArgumentOrRawProperty:
+                        return Syntax.OptionalGetValueOrDefault(name, Syntax.ThisDot(rawPropertyName));
                     case ArgSource.OptionalArgumentOrProperty:
                         return Syntax.OptionalGetValueOrDefault(name, Syntax.ThisDot(propertyName));
                     case ArgSource.OptionalArgumentOrTemplate:
                         return Syntax.OptionalGetValueOrDefault(name, SyntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, DefaultInstanceFieldName, propertyName));
+                    case ArgSource.OptionalArgumentOrTemplateRawProperty:
+                        return Syntax.OptionalGetValueOrDefault(name, SyntaxFactory.MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, DefaultInstanceFieldName, rawPropertyName));
                     case ArgSource.Missing:
                         return SyntaxFactory.DefaultExpression(Syntax.OptionalOf(GetFullyQualifiedSymbolName(f.Type)));
                     default:
@@ -694,6 +724,23 @@
         private static bool IsFieldRequired(IFieldSymbol fieldSymbol)
         {
             return IsAttributeApplied<RequiredAttribute>(fieldSymbol);
+        }
+
+        private ITypeSymbol GetPropertyType(IFieldSymbol fieldSymbol)
+        {
+            var type = fieldSymbol.Type;
+
+            var propertyTypeAttr =
+                fieldSymbol
+                ?.GetAttributes()
+                .FirstOrDefault(a => IsOrDerivesFrom<PropertyTypeAttribute>(a.AttributeClass));
+
+            if (propertyTypeAttr != null)
+            {
+                type = (INamedTypeSymbol)propertyTypeAttr.ConstructorArguments.First().Value;
+            }
+
+            return type;
         }
 
         private static bool IsFieldIgnored(IFieldSymbol fieldSymbol)
@@ -1211,6 +1258,11 @@
                 }
             }
 
+            public IdentifierNameSyntax NameAsRawProperty
+            {
+                get { return SyntaxFactory.IdentifierName(GetRawPropertyNameForField(this.Symbol.Name)); }
+            }
+
             public INamespaceOrTypeSymbol Type
             {
                 get { return this.Symbol?.Type; }
@@ -1383,8 +1435,10 @@
         {
             Property,
             Argument,
+            OptionalArgumentOrRawProperty,
             OptionalArgumentOrProperty,
             OptionalArgumentOrTemplate,
+            OptionalArgumentOrTemplateRawProperty,
             Missing,
         }
 
